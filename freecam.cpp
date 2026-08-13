@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <fstream>
 #include <string>
+#include <unistd.h>
 
 // Gloss и Mod хедеры
 #include "pl/Gloss.h"
@@ -125,13 +126,18 @@ static bool patchSlot(uintptr_t vt, int slot, void* hook, void** orig) {
     if (!vt) return false;
     uintptr_t* p = (uintptr_t*)(vt + slot * 8);
     *orig = (void*)(*p);
-    uintptr_t pg = (uintptr_t)p & ~4095UL;
-    if (mprotect((void*)pg, 4096, PROT_READ | PROT_WRITE) != 0) {
+
+    // Получаем реальный размер страницы памяти (поддерживает 4KB, 16KB, 64KB на новых Android)
+    long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0) pageSize = 4096;
+
+    uintptr_t pg = (uintptr_t)p & ~(pageSize - 1);
+    if (mprotect((void*)pg, pageSize, PROT_READ | PROT_WRITE) != 0) {
         LOGE("mprotect failed slot %d", slot);
         return false;
     }
     *p = (uintptr_t)hook;
-    mprotect((void*)pg, 4096, PROT_READ);
+    mprotect((void*)pg, pageSize, PROT_READ);
     LOGI("slot %d hooked", slot);
     return true;
 }
@@ -302,9 +308,19 @@ void LeviMod_Load(JavaVM* /*vm*/, const PLModInfo* info) {
         LOGE("libEGL.so not found");
     }
 
-    // регистрация колбэков через GetPreloaderInput
+    // регистрация колбэков через GetPreloaderInput с поиском dlsym в libpreloader.so
     typedef PreloaderInput_Interface* (*GetPI_fn)();
     GetPI_fn getPI = (GetPI_fn)dlsym(RTLD_DEFAULT, "GetPreloaderInput");
+    if (!getPI) {
+        LOGI("GetPreloaderInput not found via RTLD_DEFAULT, trying explicitly via libpreloader.so...");
+        void* libPreloader = dlopen("libpreloader.so", RTLD_NOW | RTLD_GLOBAL);
+        if (libPreloader) {
+            getPI = (GetPI_fn)dlsym(libPreloader, "GetPreloaderInput");
+        } else {
+            LOGE("Failed to dlopen libpreloader.so");
+        }
+    }
+
     if (getPI) {
         auto* input = getPI();
         if (input) {
