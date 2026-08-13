@@ -93,11 +93,20 @@ static std::vector<Segment> getMinecraftSegments() {
     return segments;
 }
 
+static bool isExecutableAddress(uintptr_t addr, const std::vector<Segment>& segments) {
+    for (const auto& seg : segments) {
+        if (seg.exec && addr >= seg.start && addr < seg.end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static uintptr_t findTypeName(const std::vector<Segment>& segments, const char* name) {
     size_t len = strlen(name);
     for (const auto& seg : segments) {
         if (seg.exec) continue; // Skip executable code segments to avoid literal pools
-        for (uintptr_t a = seg.start; a + len <= seg.end; a++) {
+        for (uintptr_t a = seg.start; a + len + 1 <= seg.end; a++) {
             if (!memcmp((void*)a, name, len + 1)) {
                 return a;
             }
@@ -110,6 +119,9 @@ static uintptr_t findTypeInfo(const std::vector<Segment>& segments, uintptr_t na
     for (const auto& seg : segments) {
         if (seg.exec) continue;
         uintptr_t startAligned = (seg.start + 7) & ~7UL;
+        if (startAligned < seg.start + 8) {
+            startAligned += 8;
+        }
         for (uintptr_t a = startAligned; a + 8 <= seg.end; a += 8) {
             if (*(uintptr_t*)a == nameAddr) {
                 return a - 8;
@@ -123,10 +135,19 @@ static uintptr_t findVtableFromTypeInfo(const std::vector<Segment>& segments, ui
     for (const auto& seg : segments) {
         if (seg.exec) continue;
         uintptr_t startAligned = (seg.start + 7) & ~7UL;
-        for (uintptr_t a = startAligned + 8; a + 8 <= seg.end; a += 8) {
+        for (uintptr_t a = startAligned + 8; a + 88 <= seg.end; a += 8) {
             if (*(uintptr_t*)a == tiAddr) {
-                if (*(uintptr_t*)(a - 8) == 0) { // Verify offset-to-top is 0
-                    return a + 8;
+                intptr_t offsetToTop = *(intptr_t*)(a - 8);
+                if (offsetToTop <= 0 && offsetToTop >= -8192) { // Verify offset-to-top is valid (not a pointer!)
+                    // Verify that suspected camera vtable functions at slots 7, 8, 9 point to executable memory
+                    uintptr_t slot7 = *(uintptr_t*)(a + 8 + 7 * 8);
+                    uintptr_t slot8 = *(uintptr_t*)(a + 8 + 8 * 8);
+                    uintptr_t slot9 = *(uintptr_t*)(a + 8 + 9 * 8);
+                    if (isExecutableAddress(slot7, segments) &&
+                        isExecutableAddress(slot8, segments) &&
+                        isExecutableAddress(slot9, segments)) {
+                        return a + 8;
+                    }
                 }
             }
         }
