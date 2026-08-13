@@ -33,6 +33,9 @@ static float g_lastTX=-1, g_lastTY=-1;
 static bool  g_rotating=false;
 static bool  g_initialized=false;
 
+// Буфер для накопления введённых символов в чате
+static std::string g_typedBuffer = "";
+
 // ── оригинальные функции ────────────────────────────────────────────────────
 static void (*g_orig_getCamPos)(void*,float*) = nullptr;
 static void (*g_orig_getCamRot)(void*,float*) = nullptr;
@@ -190,16 +193,34 @@ static bool onTouch(int action, int /*pointerId*/, float x, float y) {
 // ── ввод текста (чат активация "fc") ──────────────────────────────────────────
 static bool onTextInput(const char* text, size_t length) {
     if (!text) return false;
-    std::string s(text, length);
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) {
-        s.pop_back();
+
+    // Накапливаем символы для поддержки посимвольного ввода (Android IME)
+    for (size_t i = 0; i < length; ++i) {
+        char c = text[i];
+        if (c >= 32 && c <= 126) {
+            g_typedBuffer += c;
+        } else if (c == '\n' || c == '\r') {
+            g_typedBuffer.clear(); // очищаем при переходе на новую строку
+        }
     }
-    if (s == "fc" || s == "FC") {
-        g_active = !g_active;
-        if (!g_active) { g_joyX = 0; g_joyY = 0; g_rotating = false; }
-        LOGI("FreeCam %s via chat input", g_active ? "ON" : "OFF");
-        return true; // поглощаем ввод "fc", чтобы он не отправился в чат буквально
+
+    // Ограничиваем размер буфера, чтобы избежать переполнения
+    if (g_typedBuffer.size() > 20) {
+        g_typedBuffer = g_typedBuffer.substr(g_typedBuffer.size() - 20);
     }
+
+    // Проверяем, оканчивается ли буфер ввода на "fc" или "FC"
+    if (g_typedBuffer.size() >= 2) {
+        std::string lastTwo = g_typedBuffer.substr(g_typedBuffer.size() - 2);
+        if (lastTwo == "fc" || lastTwo == "FC") {
+            g_active = !g_active;
+            if (!g_active) { g_joyX = 0; g_joyY = 0; g_rotating = false; }
+            LOGI("FreeCam %s via text input", g_active ? "ON" : "OFF");
+            g_typedBuffer.clear(); // очищаем буфер, чтобы избежать двойного срабатывания
+            return false; // возвращаем false, чтобы символы продолжали отображаться в чате
+        }
+    }
+
     return false;
 }
 
@@ -247,15 +268,24 @@ void LeviMod_Load(JavaVM* /*vm*/, const PLModInfo* info) {
 
     GlossInit(true);
 
-    // хук камеры
+    // хук камеры с поддержкой резервных вариантов имен классов (vtable)
     uintptr_t vt = findVtable("16VanillaCameraAPI");
+    if (!vt) {
+        LOGI("VanillaCameraAPI vtable not found, trying VanillaCamera fallback...");
+        vt = findVtable("13VanillaCamera");
+    }
+    if (!vt) {
+        LOGI("VanillaCamera vtable not found, trying Camera fallback...");
+        vt = findVtable("6Camera");
+    }
+
     if (vt) {
         patchSlot(vt, 7, (void*)hook_getPerspective, (void**)&g_orig_getPerspective);
         patchSlot(vt, 8, (void*)hook_getCamPos,      (void**)&g_orig_getCamPos);
         patchSlot(vt, 9, (void*)hook_getCamRot,      (void**)&g_orig_getCamRot);
-        LOGI("Camera hooked");
+        LOGI("Camera hooked successfully!");
     } else {
-        LOGE("VanillaCameraAPI vtable not found — FreeCam will not work");
+        LOGE("No camera vtables found (checked VanillaCameraAPI, VanillaCamera, Camera) — FreeCam will not work!");
     }
 
     // хук eglSwapBuffers для тика движения
