@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <fstream>
 #include <string>
+#include <unistd.h>
 
 // Gloss и Mod хедеры
 #include "pl/Gloss.h"
@@ -32,6 +33,11 @@ static float g_joyX=0, g_joyY=0;
 static float g_lastTX=-1, g_lastTY=-1;
 static bool  g_rotating=false;
 static bool  g_initialized=false;
+static bool  g_cameraHooked=false;
+static int   g_hookRetries=0;
+
+// Буфер для накопления введённых символов в чате
+static std::string g_typedBuffer = "";
 
 // ── оригинальные функции ────────────────────────────────────────────────────
 static void (*g_orig_getCamPos)(void*,float*) = nullptr;
@@ -73,8 +79,9 @@ static uintptr_t findVtable(const char* name) {
     std::string line;
     uintptr_t nameAddr = 0;
 
+    // Поддерживаем разные имена библиотек игры: libminecraftpe.so, libminecraft.so, libminecraftpe_rt.so
     while (std::getline(m, line)) {
-        if (line.find("libminecraftpe.so") == std::string::npos) continue;
+        if (line.find("minecraft") == std::string::npos) continue;
         uintptr_t s = 0, e = 0;
         char perm[16] = {0};
         if (sscanf(line.c_str(), "%lx-%lx %15s", &s, &e, perm) != 3) continue;
@@ -85,11 +92,12 @@ static uintptr_t findVtable(const char* name) {
         if (nameAddr) break;
     }
     if (!nameAddr) { LOGE("typeinfo name not found: %s", name); return 0; }
+    LOGI("Typeinfo name %s found at %p", name, (void*)nameAddr);
 
     std::ifstream m2("/proc/self/maps");
     uintptr_t tiAddr = 0;
     while (std::getline(m2, line)) {
-        if (line.find("libminecraftpe.so") == std::string::npos) continue;
+        if (line.find("minecraft") == std::string::npos) continue;
         uintptr_t s = 0, e = 0;
         char perm[16] = {0};
         if (sscanf(line.c_str(), "%lx-%lx %15s", &s, &e, perm) != 3) continue;
@@ -99,12 +107,13 @@ static uintptr_t findVtable(const char* name) {
         }
         if (tiAddr) break;
     }
-    if (!tiAddr) { LOGE("typeinfo not found"); return 0; }
+    if (!tiAddr) { LOGE("typeinfo not found for %s", name); return 0; }
+    LOGI("Typeinfo structure for %s found at %p", name, (void*)tiAddr);
 
     std::ifstream m3("/proc/self/maps");
     uintptr_t vt = 0;
     while (std::getline(m3, line)) {
-        if (line.find("libminecraftpe.so") == std::string::npos) continue;
+        if (line.find("minecraft") == std::string::npos) continue;
         uintptr_t s = 0, e = 0;
         char perm[16] = {0};
         if (sscanf(line.c_str(), "%lx-%lx %15s", &s, &e, perm) != 3) continue;
@@ -114,7 +123,11 @@ static uintptr_t findVtable(const char* name) {
         }
         if (vt) break;
     }
-    if (!vt) LOGE("vtable not found for %s", name);
+    if (!vt) {
+        LOGE("vtable not found for %s", name);
+    } else {
+        LOGI("Vtable for %s found successfully at %p", name, (void*)vt);
+    }
     return vt;
 }
 
@@ -122,13 +135,18 @@ static bool patchSlot(uintptr_t vt, int slot, void* hook, void** orig) {
     if (!vt) return false;
     uintptr_t* p = (uintptr_t*)(vt + slot * 8);
     *orig = (void*)(*p);
-    uintptr_t pg = (uintptr_t)p & ~4095UL;
-    if (mprotect((void*)pg, 4096, PROT_READ | PROT_WRITE) != 0) {
+
+    // Получаем реальный размер страницы памяти (поддерживает 4KB, 16KB, 64KB на новых Android)
+    long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0) pageSize = 4096;
+
+    uintptr_t pg = (uintptr_t)p & ~(pageSize - 1);
+    if (mprotect((void*)pg, pageSize, PROT_READ | PROT_WRITE) != 0) {
         LOGE("mprotect failed slot %d", slot);
         return false;
     }
     *p = (uintptr_t)hook;
-    mprotect((void*)pg, 4096, PROT_READ);
+    mprotect((void*)pg, pageSize, PROT_READ);
     LOGI("slot %d hooked", slot);
     return true;
 }
@@ -190,21 +208,87 @@ static bool onTouch(int action, int /*pointerId*/, float x, float y) {
 // ── ввод текста (чат активация "fc") ──────────────────────────────────────────
 static bool onTextInput(const char* text, size_t length) {
     if (!text) return false;
-    std::string s(text, length);
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) {
-        s.pop_back();
+
+    // Накапливаем символы для поддержки посимвольного ввода (Android IME)
+    for (size_t i = 0; i < length; ++i) {
+        char c = text[i];
+        if (c >= 32 && c <= 126) {
+            g_typedBuffer += c;
+        } else if (c == '\n' || c == '\r') {
+            g_typedBuffer.clear(); // очищаем при переходе на новую строку
+        }
     }
-    if (s == "fc" || s == "FC") {
-        g_active = !g_active;
-        if (!g_active) { g_joyX = 0; g_joyY = 0; g_rotating = false; }
-        LOGI("FreeCam %s via chat input", g_active ? "ON" : "OFF");
-        return true; // поглощаем ввод "fc", чтобы он не отправился в чат буквально
+
+    // Ограничиваем размер буфера, чтобы избежать переполнения
+    if (g_typedBuffer.size() > 50) {
+        g_typedBuffer = g_typedBuffer.substr(g_typedBuffer.size() - 50);
     }
+
+    // Очищаем отступы и пробелы в конце, чтобы поддерживать автоисправление/пробелы клавиатур
+    std::string clean = g_typedBuffer;
+    while (!clean.empty() && (clean.back() == ' ' || clean.back() == '\n' || clean.back() == '\r' || clean.back() == '\t')) {
+        clean.pop_back();
+    }
+
+    // Проверяем, оканчивается ли буфер ввода на "fc" или "FC" как отдельное слово/команду
+    if (clean.size() >= 2) {
+        std::string lastTwo = clean.substr(clean.size() - 2);
+        if (lastTwo == "fc" || lastTwo == "FC") {
+            // Проверяем, что перед "fc" идет пробел, косая черта, или это начало строки (чтобы избежать ложных срабатываний на "kfc")
+            bool match = false;
+            if (clean.size() == 2) {
+                match = true;
+            } else {
+                char prevChar = clean[clean.size() - 3];
+                if (prevChar == ' ' || prevChar == '/' || prevChar == '.' || prevChar == '!') {
+                    match = true;
+                }
+            }
+
+            if (match) {
+                g_active = !g_active;
+                if (!g_active) { g_joyX = 0; g_joyY = 0; g_rotating = false; }
+                LOGI("FreeCam %s via text input", g_active ? "ON" : "OFF");
+                g_typedBuffer.clear(); // очищаем буфер, чтобы избежать двойного срабатывания
+                return false; // возвращаем false, чтобы символы продолжали отображаться в чате
+            }
+        }
+    }
+
     return false;
+}
+
+// Функция для ленивого хука камеры при рендеринге первого кадра (когда игра уже гарантированно загружена в память)
+static void tryHookCamera() {
+    if (g_cameraHooked) return;
+    if (g_hookRetries >= 10) return; // Лимитируем количество попыток, чтобы не нагружать поток рендеринга
+    g_hookRetries++;
+
+    // хук камеры с поддержкой резервных вариантов имен классов (vtable)
+    uintptr_t vt = findVtable("16VanillaCameraAPI");
+    if (!vt) vt = findVtable("13VanillaCamera");
+    if (!vt) vt = findVtable("6Camera");
+    if (!vt) vt = findVtable("12CameraSystem");
+    if (!vt) vt = findVtable("12RenderCamera");
+
+    if (vt) {
+        patchSlot(vt, 7, (void*)hook_getPerspective, (void**)&g_orig_getPerspective);
+        patchSlot(vt, 8, (void*)hook_getCamPos,      (void**)&g_orig_getCamPos);
+        patchSlot(vt, 9, (void*)hook_getCamRot,      (void**)&g_orig_getCamRot);
+        LOGI("Camera hooked successfully!");
+        g_cameraHooked = true;
+    } else {
+        LOGE("No camera vtables found yet (will retry next frame, attempt %d/10)", g_hookRetries);
+    }
 }
 
 // ── EGL хук для тика движения ──────────────────────────────────────────────
 static EGLBoolean hook_swap(EGLDisplay dpy, EGLSurface surf) {
+    // Выполняем ленивый хук при первом рендере кадра (когда библиотеки игры гарантированно загружены в память)
+    if (!g_cameraHooked) {
+        tryHookCamera();
+    }
+
     if (g_active) {
         // обновляем размер экрана
         EGLint w = 0, h = 0;
@@ -247,17 +331,6 @@ void LeviMod_Load(JavaVM* /*vm*/, const PLModInfo* info) {
 
     GlossInit(true);
 
-    // хук камеры
-    uintptr_t vt = findVtable("16VanillaCameraAPI");
-    if (vt) {
-        patchSlot(vt, 7, (void*)hook_getPerspective, (void**)&g_orig_getPerspective);
-        patchSlot(vt, 8, (void*)hook_getCamPos,      (void**)&g_orig_getCamPos);
-        patchSlot(vt, 9, (void*)hook_getCamRot,      (void**)&g_orig_getCamRot);
-        LOGI("Camera hooked");
-    } else {
-        LOGE("VanillaCameraAPI vtable not found — FreeCam will not work");
-    }
-
     // хук eglSwapBuffers для тика движения
     void* libEGL = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
     if (libEGL) {
@@ -272,7 +345,7 @@ void LeviMod_Load(JavaVM* /*vm*/, const PLModInfo* info) {
         LOGE("libEGL.so not found");
     }
 
-    // регистрация колбэков через GetPreloaderInput
+    // регистрация колбэков через GetPreloaderInput с поиском dlsym в RTLD_DEFAULT
     typedef PreloaderInput_Interface* (*GetPI_fn)();
     GetPI_fn getPI = (GetPI_fn)dlsym(RTLD_DEFAULT, "GetPreloaderInput");
     if (getPI) {
