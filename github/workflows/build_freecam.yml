@@ -31,9 +31,9 @@ jobs:
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DANDROID=true \
-            -DPRELOADER_SRC=$(pwd)/preloader-sdk/src \
+            -DPRELOADER_SDK=$(pwd)/preloader-sdk \
             -Bbuild \
-            -S freecam_mod
+            -S .
           cmake --build build
 
       - name: Upload
@@ -42,4 +42,4 @@ jobs:
           name: freecam-mod
           path: |
             build/libfreecam.so
-            freecam_mod/manifest.json
+            manifest.json
