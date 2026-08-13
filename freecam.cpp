@@ -34,6 +34,7 @@ static float g_lastTX=-1, g_lastTY=-1;
 static bool  g_rotating=false;
 static bool  g_initialized=false;
 static bool  g_cameraHooked=false;
+static int   g_hookRetries=0;
 
 // Буфер для накопления введённых символов в чате
 static std::string g_typedBuffer = "";
@@ -260,6 +261,8 @@ static bool onTextInput(const char* text, size_t length) {
 // Функция для ленивого хука камеры при рендеринге первого кадра (когда игра уже гарантированно загружена в память)
 static void tryHookCamera() {
     if (g_cameraHooked) return;
+    if (g_hookRetries >= 10) return; // Лимитируем количество попыток, чтобы не нагружать поток рендеринга
+    g_hookRetries++;
 
     // хук камеры с поддержкой резервных вариантов имен классов (vtable)
     uintptr_t vt = findVtable("16VanillaCameraAPI");
@@ -275,7 +278,7 @@ static void tryHookCamera() {
         LOGI("Camera hooked successfully!");
         g_cameraHooked = true;
     } else {
-        LOGE("No camera vtables found yet (will retry next frame)");
+        LOGE("No camera vtables found yet (will retry next frame, attempt %d/10)", g_hookRetries);
     }
 }
 
@@ -342,19 +345,9 @@ void LeviMod_Load(JavaVM* /*vm*/, const PLModInfo* info) {
         LOGE("libEGL.so not found");
     }
 
-    // регистрация колбэков через GetPreloaderInput с поиском dlsym в libpreloader.so
+    // регистрация колбэков через GetPreloaderInput с поиском dlsym в RTLD_DEFAULT
     typedef PreloaderInput_Interface* (*GetPI_fn)();
     GetPI_fn getPI = (GetPI_fn)dlsym(RTLD_DEFAULT, "GetPreloaderInput");
-    if (!getPI) {
-        LOGI("GetPreloaderInput not found via RTLD_DEFAULT, trying explicitly via libpreloader.so...");
-        void* libPreloader = dlopen("libpreloader.so", RTLD_NOW | RTLD_GLOBAL);
-        if (libPreloader) {
-            getPI = (GetPI_fn)dlsym(libPreloader, "GetPreloaderInput");
-        } else {
-            LOGE("Failed to dlopen libpreloader.so");
-        }
-    }
-
     if (getPI) {
         auto* input = getPI();
         if (input) {
