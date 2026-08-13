@@ -33,6 +33,7 @@ static float g_joyX=0, g_joyY=0;
 static float g_lastTX=-1, g_lastTY=-1;
 static bool  g_rotating=false;
 static bool  g_initialized=false;
+static bool  g_cameraHooked=false;
 
 // Буфер для накопления введённых символов в чате
 static std::string g_typedBuffer = "";
@@ -256,8 +257,35 @@ static bool onTextInput(const char* text, size_t length) {
     return false;
 }
 
+// Функция для ленивого хука камеры при рендеринге первого кадра (когда игра уже гарантированно загружена в память)
+static void tryHookCamera() {
+    if (g_cameraHooked) return;
+
+    // хук камеры с поддержкой резервных вариантов имен классов (vtable)
+    uintptr_t vt = findVtable("16VanillaCameraAPI");
+    if (!vt) vt = findVtable("13VanillaCamera");
+    if (!vt) vt = findVtable("6Camera");
+    if (!vt) vt = findVtable("12CameraSystem");
+    if (!vt) vt = findVtable("12RenderCamera");
+
+    if (vt) {
+        patchSlot(vt, 7, (void*)hook_getPerspective, (void**)&g_orig_getPerspective);
+        patchSlot(vt, 8, (void*)hook_getCamPos,      (void**)&g_orig_getCamPos);
+        patchSlot(vt, 9, (void*)hook_getCamRot,      (void**)&g_orig_getCamRot);
+        LOGI("Camera hooked successfully!");
+        g_cameraHooked = true;
+    } else {
+        LOGE("No camera vtables found yet (will retry next frame)");
+    }
+}
+
 // ── EGL хук для тика движения ──────────────────────────────────────────────
 static EGLBoolean hook_swap(EGLDisplay dpy, EGLSurface surf) {
+    // Выполняем ленивый хук при первом рендере кадра (когда библиотеки игры гарантированно загружены в память)
+    if (!g_cameraHooked) {
+        tryHookCamera();
+    }
+
     if (g_active) {
         // обновляем размер экрана
         EGLint w = 0, h = 0;
@@ -299,26 +327,6 @@ void LeviMod_Load(JavaVM* /*vm*/, const PLModInfo* info) {
     if (g_initialized) { LOGI("Already initialized"); return; }
 
     GlossInit(true);
-
-    // хук камеры с поддержкой резервных вариантов имен классов (vtable)
-    uintptr_t vt = findVtable("16VanillaCameraAPI");
-    if (!vt) {
-        LOGI("VanillaCameraAPI vtable not found, trying VanillaCamera fallback...");
-        vt = findVtable("13VanillaCamera");
-    }
-    if (!vt) {
-        LOGI("VanillaCamera vtable not found, trying Camera fallback...");
-        vt = findVtable("6Camera");
-    }
-
-    if (vt) {
-        patchSlot(vt, 7, (void*)hook_getPerspective, (void**)&g_orig_getPerspective);
-        patchSlot(vt, 8, (void*)hook_getCamPos,      (void**)&g_orig_getCamPos);
-        patchSlot(vt, 9, (void*)hook_getCamRot,      (void**)&g_orig_getCamRot);
-        LOGI("Camera hooked successfully!");
-    } else {
-        LOGE("No camera vtables found (checked VanillaCameraAPI, VanillaCamera, Camera) — FreeCam will not work!");
-    }
 
     // хук eglSwapBuffers для тика движения
     void* libEGL = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
