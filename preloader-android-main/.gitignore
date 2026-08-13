@@ -1,9 +1,0 @@
-.vscode
-.xmake
-/build*
-.idea
-site
-docs/node_modules
-docs/.vitepress/.temp
-docs/.vitepress/cache
-docs/.vitepress/dist

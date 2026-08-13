@@ -9,6 +9,7 @@
 #include <fstream>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 // Gloss и Mod хедеры
 #include "pl/Gloss.h"
@@ -33,8 +34,6 @@ static float g_joyX=0, g_joyY=0;
 static float g_lastTX=-1, g_lastTY=-1;
 static bool  g_rotating=false;
 static bool  g_initialized=false;
-static bool  g_cameraHooked=false;
-static int   g_hookRetries=0;
 
 // Буфер для накопления введённых символов в чате
 static std::string g_typedBuffer = "";
@@ -73,61 +72,91 @@ static int hook_getPerspective(void* s) {
 }
 
 // ── поиск vtable ────────────────────────────────────────────────────────────
-static uintptr_t findVtable(const char* name) {
-    size_t len = strlen(name);
+struct Segment {
+    uintptr_t start;
+    uintptr_t end;
+    bool exec;
+};
+
+static std::vector<Segment> getMinecraftSegments() {
+    std::vector<Segment> segments;
     std::ifstream m("/proc/self/maps");
     std::string line;
-    uintptr_t nameAddr = 0;
-
-    // Поддерживаем разные имена библиотек игры: libminecraftpe.so, libminecraft.so, libminecraftpe_rt.so
     while (std::getline(m, line)) {
         if (line.find("minecraft") == std::string::npos) continue;
         uintptr_t s = 0, e = 0;
         char perm[16] = {0};
         if (sscanf(line.c_str(), "%lx-%lx %15s", &s, &e, perm) != 3) continue;
         if (perm[0] != 'r') continue;
-        for (uintptr_t a = s; a + len <= e; a++) {
-            if (!memcmp((void*)a, name, len)) { nameAddr = a; break; }
-        }
-        if (nameAddr) break;
+        segments.push_back({s, e, perm[2] == 'x'});
     }
-    if (!nameAddr) { LOGE("typeinfo name not found: %s", name); return 0; }
-    LOGI("Typeinfo name %s found at %p", name, (void*)nameAddr);
+    return segments;
+}
 
-    std::ifstream m2("/proc/self/maps");
-    uintptr_t tiAddr = 0;
-    while (std::getline(m2, line)) {
-        if (line.find("minecraft") == std::string::npos) continue;
-        uintptr_t s = 0, e = 0;
-        char perm[16] = {0};
-        if (sscanf(line.c_str(), "%lx-%lx %15s", &s, &e, perm) != 3) continue;
-        if (perm[0] != 'r') continue;
-        for (uintptr_t a = s; a + 8 <= e; a += 8) {
-            if (*(uintptr_t*)a == nameAddr) { tiAddr = a - 8; break; }
+static uintptr_t findTypeName(const std::vector<Segment>& segments, const char* name) {
+    size_t len = strlen(name);
+    for (const auto& seg : segments) {
+        if (seg.exec) continue; // Skip executable code segments to avoid literal pools
+        for (uintptr_t a = seg.start; a + len <= seg.end; a++) {
+            if (!memcmp((void*)a, name, len + 1)) {
+                return a;
+            }
         }
-        if (tiAddr) break;
     }
-    if (!tiAddr) { LOGE("typeinfo not found for %s", name); return 0; }
-    LOGI("Typeinfo structure for %s found at %p", name, (void*)tiAddr);
+    return 0;
+}
 
-    std::ifstream m3("/proc/self/maps");
-    uintptr_t vt = 0;
-    while (std::getline(m3, line)) {
-        if (line.find("minecraft") == std::string::npos) continue;
-        uintptr_t s = 0, e = 0;
-        char perm[16] = {0};
-        if (sscanf(line.c_str(), "%lx-%lx %15s", &s, &e, perm) != 3) continue;
-        if (perm[0] != 'r') continue;
-        for (uintptr_t a = s; a + 8 <= e; a += 8) {
-            if (*(uintptr_t*)a == tiAddr) { vt = a + 8; break; }
+static uintptr_t findTypeInfo(const std::vector<Segment>& segments, uintptr_t nameAddr) {
+    for (const auto& seg : segments) {
+        if (seg.exec) continue;
+        uintptr_t startAligned = (seg.start + 7) & ~7UL;
+        for (uintptr_t a = startAligned; a + 8 <= seg.end; a += 8) {
+            if (*(uintptr_t*)a == nameAddr) {
+                return a - 8;
+            }
         }
-        if (vt) break;
     }
+    return 0;
+}
+
+static uintptr_t findVtableFromTypeInfo(const std::vector<Segment>& segments, uintptr_t tiAddr) {
+    for (const auto& seg : segments) {
+        if (seg.exec) continue;
+        uintptr_t startAligned = (seg.start + 7) & ~7UL;
+        for (uintptr_t a = startAligned + 8; a + 8 <= seg.end; a += 8) {
+            if (*(uintptr_t*)a == tiAddr) {
+                if (*(uintptr_t*)(a - 8) == 0) { // Verify offset-to-top is 0
+                    return a + 8;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static uintptr_t findVtable(const char* name) {
+    auto segments = getMinecraftSegments();
+    if (segments.empty()) return 0;
+
+    uintptr_t nameAddr = findTypeName(segments, name);
+    if (!nameAddr) {
+        LOGE("Typeinfo name %s not found", name);
+        return 0;
+    }
+
+    uintptr_t tiAddr = findTypeInfo(segments, nameAddr);
+    if (!tiAddr) {
+        LOGE("Typeinfo structure for %s not found", name);
+        return 0;
+    }
+
+    uintptr_t vt = findVtableFromTypeInfo(segments, tiAddr);
     if (!vt) {
-        LOGE("vtable not found for %s", name);
-    } else {
-        LOGI("Vtable for %s found successfully at %p", name, (void*)vt);
+        LOGE("Vtable for %s not found", name);
+        return 0;
     }
+
+    LOGI("Vtable for %s found successfully at %p", name, (void*)vt);
     return vt;
 }
 
@@ -258,37 +287,8 @@ static bool onTextInput(const char* text, size_t length) {
     return false;
 }
 
-// Функция для ленивого хука камеры при рендеринге первого кадра (когда игра уже гарантированно загружена в память)
-static void tryHookCamera() {
-    if (g_cameraHooked) return;
-    if (g_hookRetries >= 10) return; // Лимитируем количество попыток, чтобы не нагружать поток рендеринга
-    g_hookRetries++;
-
-    // хук камеры с поддержкой резервных вариантов имен классов (vtable)
-    uintptr_t vt = findVtable("16VanillaCameraAPI");
-    if (!vt) vt = findVtable("13VanillaCamera");
-    if (!vt) vt = findVtable("6Camera");
-    if (!vt) vt = findVtable("12CameraSystem");
-    if (!vt) vt = findVtable("12RenderCamera");
-
-    if (vt) {
-        patchSlot(vt, 7, (void*)hook_getPerspective, (void**)&g_orig_getPerspective);
-        patchSlot(vt, 8, (void*)hook_getCamPos,      (void**)&g_orig_getCamPos);
-        patchSlot(vt, 9, (void*)hook_getCamRot,      (void**)&g_orig_getCamRot);
-        LOGI("Camera hooked successfully!");
-        g_cameraHooked = true;
-    } else {
-        LOGE("No camera vtables found yet (will retry next frame, attempt %d/10)", g_hookRetries);
-    }
-}
-
 // ── EGL хук для тика движения ──────────────────────────────────────────────
 static EGLBoolean hook_swap(EGLDisplay dpy, EGLSurface surf) {
-    // Выполняем ленивый хук при первом рендере кадра (когда библиотеки игры гарантированно загружены в память)
-    if (!g_cameraHooked) {
-        tryHookCamera();
-    }
-
     if (g_active) {
         // обновляем размер экрана
         EGLint w = 0, h = 0;
@@ -330,6 +330,22 @@ void LeviMod_Load(JavaVM* /*vm*/, const PLModInfo* info) {
     if (g_initialized) { LOGI("Already initialized"); return; }
 
     GlossInit(true);
+
+    // Выполняем хук камеры на главном потоке во время загрузки (предотвращает SIGSYS краши на потоке рендеринга)
+    uintptr_t vt = findVtable("16VanillaCameraAPI");
+    if (!vt) vt = findVtable("13VanillaCamera");
+    if (!vt) vt = findVtable("6Camera");
+    if (!vt) vt = findVtable("12CameraSystem");
+    if (!vt) vt = findVtable("12RenderCamera");
+
+    if (vt) {
+        patchSlot(vt, 7, (void*)hook_getPerspective, (void**)&g_orig_getPerspective);
+        patchSlot(vt, 8, (void*)hook_getCamPos,      (void**)&g_orig_getCamPos);
+        patchSlot(vt, 9, (void*)hook_getCamRot,      (void**)&g_orig_getCamRot);
+        LOGI("Camera hooked successfully!");
+    } else {
+        LOGE("No camera vtables found (checked VanillaCameraAPI, VanillaCamera, Camera, CameraSystem, RenderCamera) — FreeCam will not work!");
+    }
 
     // хук eglSwapBuffers для тика движения
     void* libEGL = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
