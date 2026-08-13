@@ -20,8 +20,9 @@ jobs:
 
       - name: Download preloader headers
         run: |
+          rm -rf preloader-sdk preloader-android-main preloader.zip
           wget -q https://github.com/LiteLDev/preloader-android/archive/refs/heads/main.zip -O preloader.zip
-          unzip -q preloader.zip
+          unzip -o -q preloader.zip
           mv preloader-android-main preloader-sdk
 
       - name: Build FreeCam
