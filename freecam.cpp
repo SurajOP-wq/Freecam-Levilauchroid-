@@ -4,18 +4,23 @@
 #include <dlfcn.h>
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 #include <sys/mman.h>
 #include <fstream>
 #include <string>
 
 // Gloss и Mod хедеры
 #include "pl/Gloss.h"
-#include "pl/Mod.h"
-#include "pl/PreloaderInput.h"
+#include "pl/legacy/LegacyMod.h"
+#include "pl/legacy/LegacyInput.h"
 
 #define TAG "FreeCam"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
 
 // ── состояние ───────────────────────────────────────────────────────────────
 static bool  g_active  = false;
@@ -38,13 +43,22 @@ static EGLBoolean (*g_orig_swap)(EGLDisplay,EGLSurface) = nullptr;
 static void hook_getCamPos(void* s, float* o) {
     if (!o) return;
     if (g_active) { o[0]=g_camX; o[1]=g_camY; o[2]=g_camZ; return; }
-    if (g_orig_getCamPos) g_orig_getCamPos(s, o);
+    if (g_orig_getCamPos) {
+        g_orig_getCamPos(s, o);
+        g_camX = o[0];
+        g_camY = o[1];
+        g_camZ = o[2];
+    }
 }
 
 static void hook_getCamRot(void* s, float* o) {
     if (!o) return;
     if (g_active) { o[0]=g_camYaw; o[1]=g_camPitch; return; }
-    if (g_orig_getCamRot) g_orig_getCamRot(s, o);
+    if (g_orig_getCamRot) {
+        g_orig_getCamRot(s, o);
+        g_camYaw = o[0];
+        g_camPitch = o[1];
+    }
 }
 
 static int hook_getPerspective(void* s) {
@@ -61,10 +75,13 @@ static uintptr_t findVtable(const char* name) {
 
     while (std::getline(m, line)) {
         if (line.find("libminecraftpe.so") == std::string::npos) continue;
-        uintptr_t s, e;
-        if (sscanf(line.c_str(), "%lx-%lx", &s, &e) != 2) continue;
-        for (uintptr_t a = s; a + len < e; a++)
+        uintptr_t s = 0, e = 0;
+        char perm[16] = {0};
+        if (sscanf(line.c_str(), "%lx-%lx %15s", &s, &e, perm) != 3) continue;
+        if (perm[0] != 'r') continue;
+        for (uintptr_t a = s; a + len <= e; a++) {
             if (!memcmp((void*)a, name, len)) { nameAddr = a; break; }
+        }
         if (nameAddr) break;
     }
     if (!nameAddr) { LOGE("typeinfo name not found: %s", name); return 0; }
@@ -73,10 +90,13 @@ static uintptr_t findVtable(const char* name) {
     uintptr_t tiAddr = 0;
     while (std::getline(m2, line)) {
         if (line.find("libminecraftpe.so") == std::string::npos) continue;
-        uintptr_t s, e;
-        if (sscanf(line.c_str(), "%lx-%lx", &s, &e) != 2) continue;
-        for (uintptr_t a = s; a + 8 < e; a += 8)
+        uintptr_t s = 0, e = 0;
+        char perm[16] = {0};
+        if (sscanf(line.c_str(), "%lx-%lx %15s", &s, &e, perm) != 3) continue;
+        if (perm[0] != 'r') continue;
+        for (uintptr_t a = s; a + 8 <= e; a += 8) {
             if (*(uintptr_t*)a == nameAddr) { tiAddr = a - 8; break; }
+        }
         if (tiAddr) break;
     }
     if (!tiAddr) { LOGE("typeinfo not found"); return 0; }
@@ -85,10 +105,13 @@ static uintptr_t findVtable(const char* name) {
     uintptr_t vt = 0;
     while (std::getline(m3, line)) {
         if (line.find("libminecraftpe.so") == std::string::npos) continue;
-        uintptr_t s, e;
-        if (sscanf(line.c_str(), "%lx-%lx", &s, &e) != 2) continue;
-        for (uintptr_t a = s; a + 8 < e; a += 8)
+        uintptr_t s = 0, e = 0;
+        char perm[16] = {0};
+        if (sscanf(line.c_str(), "%lx-%lx %15s", &s, &e, perm) != 3) continue;
+        if (perm[0] != 'r') continue;
+        for (uintptr_t a = s; a + 8 <= e; a += 8) {
             if (*(uintptr_t*)a == tiAddr) { vt = a + 8; break; }
+        }
         if (vt) break;
     }
     if (!vt) LOGE("vtable not found for %s", name);
@@ -137,6 +160,7 @@ static bool onTouch(int action, int /*pointerId*/, float x, float y) {
             } else {
                 g_lastTX = x; g_lastTY = y; g_rotating = true;
             }
+            return true; // поглощаем тач при активном фрикаме
         }
     }
     if (action == 2 && g_active) {
@@ -151,10 +175,30 @@ static bool onTouch(int action, int /*pointerId*/, float x, float y) {
             g_joyX = (x - 90.f) / 80.f;
             g_joyY = (y - (g_screenH - 90.f)) / 80.f;
         }
+        return true; // поглощаем тач при активном фрикаме
     }
     if (action == 1) {
-        g_rotating = false; g_lastTX = -1;
-        if (!inJoy(x, y)) { g_joyX = 0; g_joyY = 0; }
+        if (g_active) {
+            g_rotating = false; g_lastTX = -1;
+            if (!inJoy(x, y)) { g_joyX = 0; g_joyY = 0; }
+            return true; // поглощаем тач при активном фрикаме
+        }
+    }
+    return false;
+}
+
+// ── ввод текста (чат активация "fc") ──────────────────────────────────────────
+static bool onTextInput(const char* text, size_t length) {
+    if (!text) return false;
+    std::string s(text, length);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) {
+        s.pop_back();
+    }
+    if (s == "fc" || s == "FC") {
+        g_active = !g_active;
+        if (!g_active) { g_joyX = 0; g_joyY = 0; g_rotating = false; }
+        LOGI("FreeCam %s via chat input", g_active ? "ON" : "OFF");
+        return true; // поглощаем ввод "fc", чтобы он не отправился в чат буквально
     }
     return false;
 }
@@ -169,12 +213,26 @@ static EGLBoolean hook_swap(EGLDisplay dpy, EGLSurface surf) {
         if (w > 0) g_screenW = w;
         if (h > 0) g_screenH = h;
 
-        // движение камеры по джойстику
+        // 3D движение камеры по джойстику
         if (g_joyX != 0.f || g_joyY != 0.f) {
             float yr = g_camYaw * (float)M_PI / 180.f;
-            float sy = sinf(yr), cy = cosf(yr);
-            g_camX += (-g_joyY * sy + g_joyX * cy) * g_speed;
-            g_camZ += ( g_joyY * cy + g_joyX * sy) * g_speed;
+            float pr = g_camPitch * (float)M_PI / 180.f;
+
+            // Вектор направления вперед:
+            float fx = -sinf(yr) * cosf(pr);
+            float fy = -sinf(pr);
+            float fz = cosf(yr) * cosf(pr);
+
+            // Вектор направления вправо:
+            float rx = cosf(yr);
+            float rz = sinf(yr);
+
+            float move_forward = -g_joyY; // joyY равен -1 при движении вперед
+            float move_right = g_joyX;
+
+            g_camX += (move_forward * fx + move_right * rx) * g_speed;
+            g_camY += (move_forward * fy) * g_speed;
+            g_camZ += (move_forward * fz + move_right * rz) * g_speed;
         }
     }
     return g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
@@ -200,7 +258,7 @@ void LeviMod_Load(JavaVM* /*vm*/, const PLModInfo* info) {
         LOGE("VanillaCameraAPI vtable not found — FreeCam will not work");
     }
 
-    // хок eglSwapBuffers для тика движения
+    // хук eglSwapBuffers для тика движения
     void* libEGL = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
     if (libEGL) {
         void* swapSym = dlsym(libEGL, "eglSwapBuffers");
@@ -214,21 +272,32 @@ void LeviMod_Load(JavaVM* /*vm*/, const PLModInfo* info) {
         LOGE("libEGL.so not found");
     }
 
-    // регистрация тач-колбэка через dlsym (не линкуем напрямую)
+    // регистрация колбэков через GetPreloaderInput
     typedef PreloaderInput_Interface* (*GetPI_fn)();
     GetPI_fn getPI = (GetPI_fn)dlsym(RTLD_DEFAULT, "GetPreloaderInput");
     if (getPI) {
         auto* input = getPI();
-        if (input && input->RegisterTouchCallback) {
-            input->RegisterTouchCallback(onTouch);
-            LOGI("Touch callback registered");
+        if (input) {
+            if (input->RegisterTouchCallback) {
+                input->RegisterTouchCallback(onTouch);
+                LOGI("Touch callback registered");
+            } else {
+                LOGE("RegisterTouchCallback not available");
+            }
+
+            if (input->RegisterTextInputCallback) {
+                input->RegisterTextInputCallback(onTextInput);
+                LOGI("TextInput callback registered");
+            } else {
+                LOGE("RegisterTextInputCallback not available");
+            }
         } else {
-            LOGE("RegisterTouchCallback not available");
+            LOGE("GetPreloaderInput returned null");
         }
     } else {
         LOGE("GetPreloaderInput not found via dlsym");
     }
 
     g_initialized = true;
-    LOGI("FreeCam ready! Tap top-right corner to toggle.");
+    LOGI("FreeCam ready! Tap top-right corner or type 'fc' in chat to toggle.");
 }
